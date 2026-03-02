@@ -1,0 +1,9 @@
+{
+	"id": "lifeup-todo-sync",
+	"name": "LifeUp Todo Sync",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "右键将 Markdown 待办写入 LifeUp",
+	"author": "lifeup_mod_coins",
+	"isDesktopOnly": false
+}

@@ -1,0 +1,41 @@
+.lifeup-panel {
+	padding: 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.lifeup-panel-status {
+	font-weight: 600;
+}
+
+.lifeup-panel-error {
+	color: var(--text-error);
+	word-break: break-word;
+}
+
+.lifeup-panel-actions {
+	display: flex;
+	gap: 8px;
+}
+
+.lifeup-panel-list {
+	margin: 0;
+	padding-left: 18px;
+	line-height: 1.7;
+}
+
+.lifeup-setting-validation {
+	margin: -4px 0 10px;
+	font-size: 12px;
+	line-height: 1.5;
+	color: var(--text-muted);
+}
+
+.lifeup-setting-validation.is-valid {
+	color: var(--text-success);
+}
+
+.lifeup-setting-validation.is-invalid {
+	color: var(--text-error);
+}
