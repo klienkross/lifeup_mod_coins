@@ -19,9 +19,11 @@ const DEFAULT_SETTINGS = {
 	defaultCoin: 0,
 	goldItemId: 5,
 	enableSkillQuery: false,
+	diarySyncMode: 'manual',
 	enableDiaryAutoSync: false,
 	diaryFolder: '',
 	diaryTitlePattern: '^\\d{4}-\\d{2}-\\d{2}$',
+	onlySyncTodayDiary: false,
 	diarySyncedMap: {},
 	timeoutMs: 10000,
 };
@@ -47,6 +49,10 @@ class LifeUpTodoPlugin extends Plugin {
 			await this.activatePanelView();
 		});
 
+		this.addRibbonIcon('list-todo', '同步当前日记待办到 LifeUp', async () => {
+			await this.syncActiveDiaryFile({ notifyResult: true });
+		});
+
 		this.registerEvent(
 			this.app.workspace.on('editor-menu', (menu, editor, view) => {
 				if (!(view instanceof MarkdownView)) {
@@ -56,7 +62,7 @@ class LifeUpTodoPlugin extends Plugin {
 				const cursor = editor.getCursor();
 				const lineText = editor.getLine(cursor.line) || '';
 				const singleTodo = this.extractTodoFromLine(lineText);
-				const selectedTodos = this.extractTodosFromSelection(editor.getSelection());
+				const selectedTodoNodes = this.extractTodoTreeFromText(editor.getSelection());
 
 				if (singleTodo) {
 					menu.addItem((item) => {
@@ -69,13 +75,13 @@ class LifeUpTodoPlugin extends Plugin {
 					});
 				}
 
-				if (selectedTodos.length > 0) {
+				if (selectedTodoNodes.length > 0) {
 					menu.addItem((item) => {
 						item
-							.setTitle(`写入 LifeUp：选中待办（${selectedTodos.length}）`)
+							.setTitle(`写入 LifeUp：选中待办（${selectedTodoNodes.length}）`)
 							.setIcon('list-checks')
 							.onClick(async () => {
-								await this.pushTodosToLifeUp(selectedTodos);
+								await this.pushTodoNodesToLifeUp(selectedTodoNodes);
 							});
 					});
 				}
@@ -127,9 +133,9 @@ class LifeUpTodoPlugin extends Plugin {
 			name: '同步当前日记待办到 LifeUp',
 			checkCallback: (checking) => {
 				const active = this.app.workspace.getActiveFile();
-				const canRun = Boolean(active && this.isDiaryFileMatch(active));
+				const canRun = active instanceof TFile;
 				if (!checking && canRun) {
-					this.syncDiaryFileTodos(active, { notifyResult: true });
+					this.syncActiveDiaryFile({ notifyResult: true });
 				}
 				return canRun;
 			},
@@ -177,6 +183,12 @@ class LifeUpTodoPlugin extends Plugin {
 			const converted = Number(loaded.defaultGold);
 			this.settings.defaultCoin = Number.isFinite(converted) ? converted : 0;
 		}
+		if (loaded.diarySyncMode == null) {
+			this.settings.diarySyncMode = loaded.enableDiaryAutoSync ? 'auto' : 'manual';
+		}
+		if (!['manual', 'auto'].includes(this.settings.diarySyncMode)) {
+			this.settings.diarySyncMode = 'manual';
+		}
 		if (loaded.category != null && loaded.taskCategoryId == null) {
 			const convertedCategory = Number(loaded.category);
 			this.settings.taskCategoryId = Number.isFinite(convertedCategory) ? convertedCategory : 0;
@@ -191,11 +203,67 @@ class LifeUpTodoPlugin extends Plugin {
 	}
 
 	extractTodoFromLine(lineText) {
-		const match = lineText.match(/^\s*[-*+]\s*\[\s\]\s+(.+?)\s*$/);
+		const parsed = this.parseTodoLine(lineText);
+		if (!parsed || parsed.checked) {
+			return null;
+		}
+		return parsed.title;
+	}
+
+	parseTodoLine(lineText) {
+		const match = String(lineText || '').match(/^(\s*)[-*+]\s*\[( |x|X)\]\s+(.+?)\s*$/);
 		if (!match) {
 			return null;
 		}
-		return match[1].trim();
+
+		const indentRaw = (match[1] || '').replace(/\t/g, '    ');
+		return {
+			indent: indentRaw.length,
+			checked: String(match[2]).toLowerCase() === 'x',
+			title: String(match[3] || '').trim(),
+		};
+	}
+
+	extractTodoTreeFromText(text) {
+		if (!text || !String(text).trim()) {
+			return [];
+		}
+
+		const lines = String(text).split(/\r?\n/);
+		const roots = [];
+		const stack = [];
+
+		for (const line of lines) {
+			const parsed = this.parseTodoLine(line);
+			if (!parsed) {
+				continue;
+			}
+
+			while (stack.length > 0 && stack[stack.length - 1].indent >= parsed.indent) {
+				stack.pop();
+			}
+
+			const node = {
+				title: parsed.title,
+				checked: parsed.checked,
+				children: [],
+			};
+
+			if (stack.length === 0) {
+				if (parsed.checked) {
+					continue;
+				}
+				roots.push(node);
+				stack.push({ indent: parsed.indent, node });
+				continue;
+			}
+
+			const parent = stack[stack.length - 1].node;
+			parent.children.push(node);
+			stack.push({ indent: parsed.indent, node });
+		}
+
+		return roots;
 	}
 
 	extractTodosFromSelection(selection) {
@@ -284,18 +352,70 @@ class LifeUpTodoPlugin extends Plugin {
 		}
 
 		if (res.json != null) {
-			return res.json;
+			return this.unwrapCloudResponse(res.json);
 		}
 
 		if (res.text) {
 			try {
-				return JSON.parse(res.text);
+				return this.unwrapCloudResponse(JSON.parse(res.text));
 			} catch (_) {
 				return { raw: res.text };
 			}
 		}
 
 		return {};
+	}
+
+	unwrapCloudResponse(payload) {
+		if (!payload || typeof payload !== 'object') {
+			return payload;
+		}
+
+		const hasCloudEnvelope = Object.prototype.hasOwnProperty.call(payload, 'code')
+			&& Object.prototype.hasOwnProperty.call(payload, 'data')
+			&& Array.isArray(payload.data);
+
+		if (!hasCloudEnvelope) {
+			return payload;
+		}
+
+		const code = Number(payload.code);
+		if (Number.isFinite(code) && code >= 400) {
+			const message = payload.message || `Cloud API error ${code}`;
+			throw new Error(String(message));
+		}
+
+		const items = payload.data;
+		if (items.length === 0) {
+			return {};
+		}
+
+		if (items.length === 1) {
+			const single = items[0];
+			if (single && typeof single === 'object' && Object.prototype.hasOwnProperty.call(single, 'result')) {
+				return single.result;
+			}
+			return single;
+		}
+
+		return items.map((item) => {
+			if (item && typeof item === 'object' && Object.prototype.hasOwnProperty.call(item, 'result')) {
+				return item.result;
+			}
+			return item;
+		});
+	}
+
+	buildTodoNodeSignature(node) {
+		if (!node) {
+			return '';
+		}
+		const title = String(node.title || '').trim();
+		const state = node.checked ? '1' : '0';
+		const children = Array.isArray(node.children)
+			? node.children.map((child) => this.buildTodoNodeSignature(child)).join('|')
+			: '';
+		return `${title}#${state}[${children}]`;
 	}
 
 	async querySimple(key, extraParams = {}) {
@@ -447,6 +567,77 @@ class LifeUpTodoPlugin extends Plugin {
 		return await this.callLifeUpApi(apiUrl);
 	}
 
+	async createLifeUpSubtask(mainTaskId, title) {
+		const safeTitle = encodeURIComponent(title);
+		const apiUrl = `lifeup://api/subtask?main_id=${mainTaskId}&todo=${safeTitle}`;
+		return await this.callLifeUpApi(apiUrl);
+	}
+
+	async completeLifeUpSubtask(mainTaskId, subtaskId) {
+		const apiUrl = `lifeup://api/subtask_operation?main_id=${mainTaskId}&edit_id=${subtaskId}&operation=complete`;
+		return await this.callLifeUpApi(apiUrl);
+	}
+
+	extractFirstNumber(source, keys) {
+		if (!source || typeof source !== 'object') {
+			return null;
+		}
+		for (const key of keys) {
+			const value = Number(source[key]);
+			if (Number.isFinite(value)) {
+				return value;
+			}
+		}
+		return null;
+	}
+
+	async createLifeUpTaskWithSubtasks(node) {
+		const createdTask = await this.createLifeUpTask(node.title);
+		const taskId = this.extractFirstNumber(createdTask, ['task_id', '_ID', 'id']);
+
+		if (!Array.isArray(node.children) || node.children.length === 0) {
+			return;
+		}
+
+		if (!taskId) {
+			throw new Error('主任务创建成功，但返回中缺少 task_id，无法创建子任务');
+		}
+
+		const flattenedChildren = this.flattenSubtaskNodes(node.children);
+
+		for (const child of flattenedChildren) {
+			const subtaskRes = await this.createLifeUpSubtask(taskId, child.title);
+			if (child.checked) {
+				const subtaskId = this.extractFirstNumber(subtaskRes, ['subtask_id', 'edit_id', 'id']);
+				if (subtaskId) {
+					await this.completeLifeUpSubtask(taskId, subtaskId);
+				}
+			}
+		}
+	}
+
+	flattenSubtaskNodes(children, ancestors = []) {
+		if (!Array.isArray(children) || children.length === 0) {
+			return [];
+		}
+
+		const rows = [];
+		for (const child of children) {
+			const currentPath = [...ancestors, child.title];
+			const displayTitle = currentPath.join(' > ');
+			rows.push({
+				title: displayTitle,
+				checked: Boolean(child.checked),
+			});
+
+			if (Array.isArray(child.children) && child.children.length > 0) {
+				rows.push(...this.flattenSubtaskNodes(child.children, currentPath));
+			}
+		}
+
+		return rows;
+	}
+
 	getDiaryTitleRegex() {
 		const rawPattern = (this.settings.diaryTitlePattern || '').trim();
 		if (!rawPattern) {
@@ -464,31 +655,57 @@ class LifeUpTodoPlugin extends Plugin {
 	}
 
 	isDiaryFileMatch(file) {
-		if (!(file instanceof TFile) || file.extension !== 'md') {
-			return false;
+		return this.getDiaryFileMismatchReason(file) === null;
+	}
+
+	getDiaryFileMismatchReason(file) {
+		if (!(file instanceof TFile)) {
+			return '当前不是文件';
+		}
+		if (file.extension !== 'md') {
+			return '当前文件不是 Markdown';
 		}
 
 		const folder = this.normalizeFolderPath(this.settings.diaryFolder);
 		if (!folder) {
-			return false;
+			return '未配置“日记文件夹”';
 		}
 
 		const filePath = (file.path || '').replace(/\\/g, '/');
 		const inFolder = filePath === folder || filePath.startsWith(`${folder}/`);
 		if (!inFolder) {
-			return false;
+			return `文件不在日记文件夹下（当前：${filePath}，配置：${folder}）`;
 		}
 
 		const titleRegex = this.getDiaryTitleRegex();
 		if (!titleRegex) {
-			return false;
+			return '日记标题正则无效';
 		}
 
-		return titleRegex.test(file.basename);
+		if (!titleRegex.test(file.basename)) {
+			return `文件名不匹配标题正则（当前：${file.basename}）`;
+		}
+
+		if (this.settings.onlySyncTodayDiary) {
+			const todayTitle = this.getLocalDateTitle();
+			if (file.basename !== todayTitle) {
+				return `已启用“仅同步本地今天”，当前文件名应为 ${todayTitle}`;
+			}
+		}
+
+		return null;
+	}
+
+	getLocalDateTitle() {
+		const now = new Date();
+		const year = now.getFullYear();
+		const month = String(now.getMonth() + 1).padStart(2, '0');
+		const day = String(now.getDate()).padStart(2, '0');
+		return `${year}-${month}-${day}`;
 	}
 
 	scheduleDiaryAutoSync(file) {
-		if (!this.settings.enableDiaryAutoSync) {
+		if (this.settings.diarySyncMode !== 'auto') {
 			return;
 		}
 		if (!(file instanceof TFile)) {
@@ -511,27 +728,35 @@ class LifeUpTodoPlugin extends Plugin {
 		this.autoSyncTimers.set(file.path, timerId);
 	}
 
-	extractTodoTitlesFromText(text) {
-		const lines = String(text || '').split(/\r?\n/);
-		const titles = [];
-		for (const line of lines) {
-			const todo = this.extractTodoFromLine(line);
-			if (todo) {
-				titles.push(todo);
+	async syncActiveDiaryFile(options = {}) {
+		const active = this.app.workspace.getActiveFile();
+		if (!(active instanceof TFile)) {
+			if (options.notifyResult) {
+				new Notice('当前没有可同步的文件');
 			}
+			return { success: 0, failed: 0, skipped: 0 };
 		}
-		return titles;
+		return await this.syncDiaryFileTodos(active, options);
+	}
+
+	extractTodoTitlesFromText(text) {
+		const roots = this.extractTodoTreeFromText(text);
+		return roots.map((node) => node.title);
 	}
 
 	async syncDiaryFileTodos(file, options = {}) {
 		const { notifyResult = false } = options;
-		if (!this.isDiaryFileMatch(file)) {
+		const mismatchReason = this.getDiaryFileMismatchReason(file);
+		if (mismatchReason) {
+			if (notifyResult) {
+				new Notice(`未执行日记同步：${mismatchReason}`);
+			}
 			return { success: 0, failed: 0, skipped: 0 };
 		}
 
 		const content = await this.app.vault.cachedRead(file);
-		const currentTodos = this.extractTodoTitlesFromText(content);
-		if (currentTodos.length === 0) {
+		const currentTodoNodes = this.extractTodoTreeFromText(content);
+		if (currentTodoNodes.length === 0) {
 			return { success: 0, failed: 0, skipped: 0 };
 		}
 
@@ -543,19 +768,21 @@ class LifeUpTodoPlugin extends Plugin {
 		let failed = 0;
 		let skipped = 0;
 
-		for (const title of currentTodos) {
-			if (syncedSet.has(title)) {
+		for (const node of currentTodoNodes) {
+			const signature = this.buildTodoNodeSignature(node);
+			if (syncedSet.has(signature) || syncedSet.has(node.title)) {
 				skipped += 1;
 				continue;
 			}
 
 			try {
-				await this.createLifeUpTask(title);
-				syncedSet.add(title);
+				await this.createLifeUpTaskWithSubtasks(node);
+				syncedSet.add(signature);
+				syncedSet.add(node.title);
 				success += 1;
 			} catch (err) {
 				failed += 1;
-				console.error('[lifeup-todo-plugin] 自动同步失败:', title, err);
+				console.error('[lifeup-todo-plugin] 自动同步失败:', node.title, err);
 			}
 		}
 
@@ -586,6 +813,33 @@ class LifeUpTodoPlugin extends Plugin {
 			} catch (err) {
 				failed += 1;
 				console.error('[lifeup-todo-plugin] 创建任务失败:', title, err);
+			}
+		}
+
+		if (failed === 0) {
+			new Notice(`已写入 LifeUp：${success} 条待办`);
+			return;
+		}
+
+		new Notice(`写入完成：成功 ${success}，失败 ${failed}`);
+	}
+
+	async pushTodoNodesToLifeUp(todoNodes) {
+		if (!todoNodes || todoNodes.length === 0) {
+			new Notice('没有可写入的待办');
+			return;
+		}
+
+		let success = 0;
+		let failed = 0;
+
+		for (const node of todoNodes) {
+			try {
+				await this.createLifeUpTaskWithSubtasks(node);
+				success += 1;
+			} catch (err) {
+				failed += 1;
+				console.error('[lifeup-todo-plugin] 创建树形任务失败:', node.title, err);
 			}
 		}
 
@@ -802,13 +1056,16 @@ class LifeUpSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName('启用日记自动同步')
-			.setDesc('自动同步指定日记文件中的未完成待办到 LifeUp')
-			.addToggle((toggle) =>
-				toggle
-					.setValue(Boolean(this.plugin.settings.enableDiaryAutoSync))
+			.setName('日记同步模式')
+			.setDesc('推荐手动按钮；自动模式可能把打字过程中的待办同步出去')
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption('manual', '手动（按钮/命令）')
+					.addOption('auto', '自动（文件变更触发）')
+					.setValue(this.plugin.settings.diarySyncMode || 'manual')
 					.onChange(async (value) => {
-						this.plugin.settings.enableDiaryAutoSync = Boolean(value);
+						this.plugin.settings.diarySyncMode = value === 'auto' ? 'auto' : 'manual';
+						this.plugin.settings.enableDiaryAutoSync = this.plugin.settings.diarySyncMode === 'auto';
 						await this.plugin.saveSettings();
 					})
 			);
@@ -835,6 +1092,18 @@ class LifeUpSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.diaryTitlePattern || '')
 					.onChange(async (value) => {
 						this.plugin.settings.diaryTitlePattern = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('仅同步本地今天日记')
+			.setDesc('开启后要求文件名等于本地日期（YYYY-MM-DD），如 2026-03-02')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.onlySyncTodayDiary))
+					.onChange(async (value) => {
+						this.plugin.settings.onlySyncTodayDiary = Boolean(value);
 						await this.plugin.saveSettings();
 					})
 			);
