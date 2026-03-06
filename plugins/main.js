@@ -10,6 +10,8 @@ const {
 } = require('obsidian');
 
 const VIEW_TYPE_LIFEUP_PANEL = 'lifeup-data-panel-view';
+const LIFEUP_TASKS_BLOCK_START = '<!-- LIFEUP_TASKS_START -->';
+const LIFEUP_TASKS_BLOCK_END = '<!-- LIFEUP_TASKS_END -->';
 
 const DEFAULT_SETTINGS = {
 	baseUrl: '',
@@ -24,6 +26,10 @@ const DEFAULT_SETTINGS = {
 	diaryFolder: '',
 	diaryTitlePattern: '^\\d{4}-\\d{2}-\\d{2}$',
 	onlySyncTodayDiary: false,
+	enableTaskPullToDiary: false,
+	taskPullMode: 'auto',
+	pullTaskCategoryId: 0,
+	pullSectionTitle: '## LifeUp 待办（自动写入）',
 	diarySyncedMap: {},
 	timeoutMs: 10000,
 };
@@ -37,6 +43,7 @@ class LifeUpTodoPlugin extends Plugin {
 			data: null,
 		};
 		this.autoSyncTimers = new Map();
+		this.taskPullTimers = new Map();
 
 		this.registerView(
 			VIEW_TYPE_LIFEUP_PANEL,
@@ -51,6 +58,10 @@ class LifeUpTodoPlugin extends Plugin {
 
 		this.addRibbonIcon('list-todo', '同步当前日记待办到 LifeUp', async () => {
 			await this.syncActiveDiaryFile({ notifyResult: true });
+		});
+
+		this.addRibbonIcon('download', '从 LifeUp 写入当前日记', async () => {
+			await this.pullTasksToActiveDiary({ notifyResult: true });
 		});
 
 		this.registerEvent(
@@ -141,6 +152,19 @@ class LifeUpTodoPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: 'pull-lifeup-tasks-into-diary',
+			name: '从 LifeUp 写入当前日记任务',
+			checkCallback: (checking) => {
+				const active = this.app.workspace.getActiveFile();
+				const canRun = active instanceof TFile;
+				if (!checking && canRun) {
+					this.pullTasksToActiveDiary({ notifyResult: true });
+				}
+				return canRun;
+			},
+		});
+
 		this.registerEvent(
 			this.app.vault.on('modify', (file) => {
 				this.scheduleDiaryAutoSync(file);
@@ -166,6 +190,12 @@ class LifeUpTodoPlugin extends Plugin {
 				this.scheduleDiaryAutoSync(file);
 			})
 		);
+
+		this.registerEvent(
+			this.app.workspace.on('file-open', (file) => {
+				this.scheduleTaskPullToDiary(file);
+			})
+		);
 	}
 
 	onunload() {
@@ -173,6 +203,10 @@ class LifeUpTodoPlugin extends Plugin {
 			window.clearTimeout(timerId);
 		}
 		this.autoSyncTimers.clear();
+		for (const timerId of this.taskPullTimers.values()) {
+			window.clearTimeout(timerId);
+		}
+		this.taskPullTimers.clear();
 		this.app.workspace.detachLeavesOfType(VIEW_TYPE_LIFEUP_PANEL);
 	}
 
@@ -195,6 +229,9 @@ class LifeUpTodoPlugin extends Plugin {
 		}
 		if (!this.settings.diarySyncedMap || typeof this.settings.diarySyncedMap !== 'object') {
 			this.settings.diarySyncedMap = {};
+		}
+		if (!['manual', 'auto'].includes(this.settings.taskPullMode)) {
+			this.settings.taskPullMode = 'auto';
 		}
 	}
 
@@ -342,6 +379,36 @@ class LifeUpTodoPlugin extends Plugin {
 		const proxyUrl = this.buildLifeUpProxyUrl(targetUrl);
 		const res = await requestUrl({
 			url: proxyUrl,
+			method: 'GET',
+			throw: false,
+			timeout: Number(this.settings.timeoutMs) || 10000,
+		});
+
+		if (res.status < 200 || res.status >= 300) {
+			throw new Error(`HTTP ${res.status}`);
+		}
+
+		if (res.json != null) {
+			return this.unwrapCloudResponse(res.json);
+		}
+
+		if (res.text) {
+			try {
+				return this.unwrapCloudResponse(JSON.parse(res.text));
+			} catch (_) {
+				return { raw: res.text };
+			}
+		}
+
+		return {};
+	}
+
+	async callLifeUpCloud(path) {
+		const baseUrl = this.resolveProxyBaseUrl();
+		const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+		const url = `${baseUrl}${normalizedPath}`;
+		const res = await requestUrl({
+			url,
 			method: 'GET',
 			throw: false,
 			timeout: Number(this.settings.timeoutMs) || 10000,
@@ -638,6 +705,164 @@ class LifeUpTodoPlugin extends Plugin {
 		return rows;
 	}
 
+	normalizeTaskListPayload(payload) {
+		if (Array.isArray(payload)) {
+			return payload;
+		}
+		if (payload && typeof payload === 'object') {
+			if (Array.isArray(payload.tasks)) {
+				return payload.tasks;
+			}
+			if (Array.isArray(payload.data)) {
+				return payload.data;
+			}
+		}
+		return [];
+	}
+
+	parseSubTasksValue(subTasksValue) {
+		if (Array.isArray(subTasksValue)) {
+			return subTasksValue;
+		}
+		if (typeof subTasksValue === 'string' && subTasksValue.trim()) {
+			try {
+				const parsed = JSON.parse(subTasksValue);
+				return Array.isArray(parsed) ? parsed : [];
+			} catch (_) {
+				return [];
+			}
+		}
+		return [];
+	}
+
+	renderLifeUpTasksMarkdown(tasks, categoryId) {
+		const sectionTitle = (this.settings.pullSectionTitle || '').trim() || '## LifeUp 待办（自动写入）';
+		const lines = [];
+		lines.push(LIFEUP_TASKS_BLOCK_START);
+		lines.push(sectionTitle);
+		lines.push(`> categoryId: ${categoryId} | updated: ${new Date().toLocaleString()}`);
+		lines.push('');
+
+		if (!tasks || tasks.length === 0) {
+			lines.push('- [ ] （该清单暂无任务）');
+		} else {
+			for (const task of tasks) {
+				const taskName = String(task?.name || task?.todo || '未命名任务').trim();
+				const statusNum = Number(task?.status);
+				const done = Number.isFinite(statusNum) ? statusNum === 1 : false;
+				lines.push(`- [${done ? 'x' : ' '}] ${taskName}`);
+
+				const subTasks = this.parseSubTasksValue(task?.subTasks);
+				for (const subTask of subTasks) {
+					const subName = String(subTask?.todo || subTask?.name || '未命名子任务').trim();
+					const subStatusNum = Number(subTask?.status);
+					const subDone = Number.isFinite(subStatusNum) ? subStatusNum === 1 : false;
+					lines.push(`  - [${subDone ? 'x' : ' '}] ${subName}`);
+				}
+			}
+		}
+
+		lines.push('');
+		lines.push(LIFEUP_TASKS_BLOCK_END);
+		return lines.join('\n');
+	}
+
+	replaceManagedLifeUpTasksBlock(sourceText, newBlock) {
+		const text = String(sourceText || '');
+		const blockRegex = new RegExp(`${LIFEUP_TASKS_BLOCK_START}[\\s\\S]*?${LIFEUP_TASKS_BLOCK_END}`);
+		if (blockRegex.test(text)) {
+			return text.replace(blockRegex, newBlock);
+		}
+
+		const trimmed = text.replace(/\s+$/, '');
+		if (!trimmed) {
+			return `${newBlock}\n`;
+		}
+		return `${trimmed}\n\n${newBlock}\n`;
+	}
+
+	stripManagedLifeUpTasksBlock(sourceText) {
+		const text = String(sourceText || '');
+		const blockRegex = new RegExp(`${LIFEUP_TASKS_BLOCK_START}[\\s\\S]*?${LIFEUP_TASKS_BLOCK_END}`, 'g');
+		return text.replace(blockRegex, '').trim();
+	}
+
+	async pullTasksToDiaryFile(file, options = {}) {
+		const { notifyResult = false } = options;
+		const mismatchReason = this.getDiaryFileMismatchReason(file);
+		if (mismatchReason) {
+			if (notifyResult) {
+				new Notice(`未写入日记：${mismatchReason}`);
+			}
+			return false;
+		}
+
+		const categoryId = Number(this.settings.pullTaskCategoryId);
+		if (!Number.isFinite(categoryId) || categoryId < 0) {
+			if (notifyResult) {
+				new Notice('未写入日记：请先设置“拉取任务清单 ID”');
+			}
+			return false;
+		}
+
+		const payload = await this.callLifeUpCloud(`/tasks/${categoryId}`);
+		const tasks = this.normalizeTaskListPayload(payload);
+		const block = this.renderLifeUpTasksMarkdown(tasks, categoryId);
+		const currentText = await this.app.vault.cachedRead(file);
+		const nextText = this.replaceManagedLifeUpTasksBlock(currentText, block);
+
+		if (nextText !== currentText) {
+			await this.app.vault.modify(file, nextText);
+		}
+
+		if (notifyResult) {
+			new Notice(`已写入日记：${tasks.length} 条 LifeUp 任务`);
+		}
+		return true;
+	}
+
+	async pullTasksToActiveDiary(options = {}) {
+		const active = this.app.workspace.getActiveFile();
+		if (!(active instanceof TFile)) {
+			if (options.notifyResult) {
+				new Notice('当前没有可写入的日记文件');
+			}
+			return false;
+		}
+		return await this.pullTasksToDiaryFile(active, options);
+	}
+
+	scheduleTaskPullToDiary(file) {
+		if (!this.settings.enableTaskPullToDiary) {
+			return;
+		}
+		if (this.settings.taskPullMode !== 'auto') {
+			return;
+		}
+		if (!(file instanceof TFile)) {
+			return;
+		}
+		if (!this.isDiaryFileMatch(file)) {
+			return;
+		}
+
+		const prev = this.taskPullTimers.get(file.path);
+		if (prev) {
+			window.clearTimeout(prev);
+		}
+
+		const timerId = window.setTimeout(async () => {
+			this.taskPullTimers.delete(file.path);
+			try {
+				await this.pullTasksToDiaryFile(file, { notifyResult: false });
+			} catch (err) {
+				console.error('[lifeup-todo-plugin] 自动写入日记失败:', err);
+			}
+		}, 500);
+
+		this.taskPullTimers.set(file.path, timerId);
+	}
+
 	getDiaryTitleRegex() {
 		const rawPattern = (this.settings.diaryTitlePattern || '').trim();
 		if (!rawPattern) {
@@ -755,7 +980,8 @@ class LifeUpTodoPlugin extends Plugin {
 		}
 
 		const content = await this.app.vault.cachedRead(file);
-		const currentTodoNodes = this.extractTodoTreeFromText(content);
+		const syncContent = this.stripManagedLifeUpTasksBlock(content);
+		const currentTodoNodes = this.extractTodoTreeFromText(syncContent);
 		if (currentTodoNodes.length === 0) {
 			return { success: 0, failed: 0, skipped: 0 };
 		}
@@ -962,8 +1188,11 @@ class LifeUpSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		containerEl.createEl('h2', { text: 'LifeUp 同步与面板设置' });
+		containerEl.createEl('p', { text: '建议按顺序配置：连接 → 日记写入 → 日记同步 → 面板显示。' });
 
-		const baseUrlSetting = new Setting(containerEl)
+		containerEl.createEl('h3', { text: '1) 连接配置' });
+
+		new Setting(containerEl)
 			.setName('云人升代理地址（推荐）')
 			.setDesc('支持完整地址，如 https://192.168.1.10:8080；填入后将优先使用')
 			.addText((text) =>
@@ -988,7 +1217,7 @@ class LifeUpSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('LifeUp 代理主机')
-			.setDesc('兼容旧配置：当“云人升代理地址”为空时生效')
+			.setDesc('兼容旧配置：仅当“云人升代理地址”为空时生效')
 			.addText((text) =>
 				text
 					.setPlaceholder('localhost')
@@ -1001,7 +1230,7 @@ class LifeUpSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('LifeUp 代理端口')
-			.setDesc('兼容旧配置：当“云人升代理地址”为空时生效')
+			.setDesc('兼容旧配置：仅当“云人升代理地址”为空时生效')
 			.addText((text) =>
 				text
 					.setPlaceholder('8080')
@@ -1014,6 +1243,22 @@ class LifeUpSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName('请求超时（毫秒）')
+			.setDesc('默认 10000')
+			.addText((text) =>
+				text
+					.setPlaceholder('10000')
+					.setValue(String(this.plugin.settings.timeoutMs))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.timeoutMs = Number.isFinite(parsed) ? parsed : 10000;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		containerEl.createEl('h3', { text: '2) Obsidian → LifeUp（日记同步）' });
+
+		new Setting(containerEl)
 			.setName('默认任务金币奖励')
 			.setDesc('创建任务时传入 LifeUp 的 coin 参数')
 			.addText((text) =>
@@ -1023,20 +1268,6 @@ class LifeUpSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						const parsed = Number(value);
 						this.plugin.settings.defaultCoin = Number.isFinite(parsed) ? parsed : 0;
-						await this.plugin.saveSettings();
-					})
-			);
-
-		new Setting(containerEl)
-			.setName('面板查询物品 ID')
-			.setDesc('用于在面板中查询指定物品拥有数，填 0 则不查询')
-			.addText((text) =>
-				text
-					.setPlaceholder('5')
-					.setValue(String(this.plugin.settings.goldItemId))
-					.onChange(async (value) => {
-						const parsed = Number(value);
-						this.plugin.settings.goldItemId = Number.isFinite(parsed) ? parsed : 0;
 						await this.plugin.saveSettings();
 					})
 			);
@@ -1108,6 +1339,63 @@ class LifeUpSettingTab extends PluginSettingTab {
 					})
 			);
 
+		containerEl.createEl('h3', { text: '3) LifeUp → Obsidian（写回日记）' });
+
+		new Setting(containerEl)
+			.setName('启用从 LifeUp 写入日记')
+			.setDesc('从指定 categoryId 拉取任务并写入日记固定区块')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.enableTaskPullToDiary))
+					.onChange(async (value) => {
+						this.plugin.settings.enableTaskPullToDiary = Boolean(value);
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('写入触发模式')
+			.setDesc('自动：打开匹配日记时写入；手动：按钮/命令触发')
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption('auto', '自动（打开日记时）')
+					.addOption('manual', '手动（按钮/命令）')
+					.setValue(this.plugin.settings.taskPullMode || 'auto')
+					.onChange(async (value) => {
+						this.plugin.settings.taskPullMode = value === 'manual' ? 'manual' : 'auto';
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('拉取任务清单 ID（categoryId）')
+			.setDesc('调用 /tasks/{categoryId} 写入日记')
+			.addText((text) =>
+				text
+					.setPlaceholder('0')
+					.setValue(String(this.plugin.settings.pullTaskCategoryId))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.pullTaskCategoryId = Number.isFinite(parsed) ? parsed : 0;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('写入区块标题')
+			.setDesc('写入日记的标题文本，如 ## LifeUp 待办（自动写入）')
+			.addText((text) =>
+				text
+					.setPlaceholder('## LifeUp 待办（自动写入）')
+					.setValue(this.plugin.settings.pullSectionTitle || '')
+					.onChange(async (value) => {
+						this.plugin.settings.pullSectionTitle = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		containerEl.createEl('h3', { text: '4) 数据面板' });
+
 		new Setting(containerEl)
 			.setName('启用属性查询（query_skill）')
 			.setDesc('开启后读取属性 ID 1~6 并显示在数据面板')
@@ -1131,6 +1419,20 @@ class LifeUpSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						const parsed = Number(value);
 						this.plugin.settings.timeoutMs = Number.isFinite(parsed) ? parsed : 10000;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('面板查询物品 ID')
+			.setDesc('用于在面板中查询指定物品拥有数，填 0 则不查询')
+			.addText((text) =>
+				text
+					.setPlaceholder('5')
+					.setValue(String(this.plugin.settings.goldItemId))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.goldItemId = Number.isFinite(parsed) ? parsed : 0;
 						await this.plugin.saveSettings();
 					})
 			);
