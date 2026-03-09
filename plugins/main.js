@@ -7,11 +7,32 @@ const {
 	requestUrl,
 	ItemView,
 	TFile,
+	Platform,
+	Modal,
 } = require('obsidian');
 
 const VIEW_TYPE_LIFEUP_PANEL = 'lifeup-data-panel-view';
 const LIFEUP_TASKS_BLOCK_START = '<!-- LIFEUP_TASKS_START -->';
 const LIFEUP_TASKS_BLOCK_END = '<!-- LIFEUP_TASKS_END -->';
+const SETTINGS_VERSION = 3;
+const AI_KEYCHAIN_SERVICE = 'lifeup-todo-sync-plugin';
+const AI_KEYCHAIN_ACCOUNT = 'ai-api-key';
+const DEFAULT_AI_SYSTEM_PROMPT = [
+	'你是任务分析助手。请根据用户给出的待办标题，输出 JSON。',
+	'必须只返回 JSON，不要返回多余文本。',
+	'字段：importance(1-4), difficulty(1-4), urgency(1-4), skill_id(1-6), deadline_text(字符串), reason(简短说明)。',
+	'若无法判断 deadline_text，可给空字符串。',
+].join('\n');
+const DEFAULT_AI_USER_PROMPT = '待办标题：{{todoTitle}}\n请给出结构化评估。';
+const DEFAULT_AI_SKILLS = [
+	{ id: 1, description: '体能/健康' },
+	{ id: 2, description: '学习/认知' },
+	{ id: 3, description: '工作/产出' },
+	{ id: 4, description: '关系/社交' },
+	{ id: 5, description: '生活/家务' },
+	{ id: 6, description: '长期目标/成长' },
+];
+const DEFAULT_AI_SKILLS_JSON = JSON.stringify(DEFAULT_AI_SKILLS, null, 2);
 
 const DEFAULT_SETTINGS = {
 	baseUrl: '',
@@ -26,22 +47,45 @@ const DEFAULT_SETTINGS = {
 	diaryFolder: '',
 	diaryTitlePattern: '^\\d{4}-\\d{2}-\\d{2}$',
 	onlySyncTodayDiary: false,
+	enableFeelingSync: false,
+	feelingPrefix: '> ',
+	feelingCaptureMode: 'prefix-only',
+	strictFeelingBinding: true,
+	enableAiFeature: false,
+	useSystemKeychain: true,
+	aiApiBaseUrl: 'https://api.openai.com/v1/chat/completions',
+	aiModel: 'gpt-4o-mini',
+	aiApiKey: '',
+	aiSystemPromptTemplate: DEFAULT_AI_SYSTEM_PROMPT,
+	aiUserPromptTemplate: DEFAULT_AI_USER_PROMPT,
+	aiSkillDefinitionsJson: DEFAULT_AI_SKILLS_JSON,
 	enableTaskPullToDiary: false,
 	taskPullMode: 'auto',
 	pullTaskCategoryId: 0,
 	pullSectionTitle: '## LifeUp 待办（自动写入）',
 	diarySyncedMap: {},
 	timeoutMs: 10000,
+	settingsVersion: SETTINGS_VERSION,
 };
 
 class LifeUpTodoPlugin extends Plugin {
 	async onload() {
-		await this.loadSettings();
+		try {
+			await this.loadSettings();
+		} catch (err) {
+			console.error('[lifeup-todo-plugin] 设置加载失败，回退默认配置:', err);
+			this.settings = Object.assign({}, DEFAULT_SETTINGS, { settingsVersion: SETTINGS_VERSION });
+			await this.saveSettings();
+			new Notice('LifeUp 插件配置异常，已自动回退为默认设置');
+		}
 		this.dashboardState = {
 			connected: false,
 			lastError: '',
 			data: null,
 		};
+		this.keytar = null;
+		this.keytarReady = false;
+		await this.initKeytar();
 		this.autoSyncTimers = new Map();
 		this.taskPullTimers = new Map();
 
@@ -84,6 +128,17 @@ class LifeUpTodoPlugin extends Plugin {
 								await this.pushTodosToLifeUp([singleTodo]);
 							});
 					});
+
+					if (this.settings.enableAiFeature) {
+						menu.addItem((item) => {
+							item
+								.setTitle('AI 分析当前待办（预览）')
+								.setIcon('sparkles')
+								.onClick(async () => {
+									await this.previewAiAnalysis(singleTodo);
+								});
+						});
+					}
 				}
 
 				if (selectedTodoNodes.length > 0) {
@@ -111,6 +166,21 @@ class LifeUpTodoPlugin extends Plugin {
 					return;
 				}
 				await this.pushTodosToLifeUp([todo]);
+			},
+		});
+
+		this.addCommand({
+			id: 'ai-analyze-current-todo-preview',
+			name: 'AI 分析当前待办（预览）',
+			editorCallback: async (editor) => {
+				const cursor = editor.getCursor();
+				const lineText = editor.getLine(cursor.line) || '';
+				const todo = this.extractTodoFromLine(lineText);
+				if (!todo) {
+					new Notice('当前行不是未完成待办（格式示例：- [ ] 任务）');
+					return;
+				}
+				await this.previewAiAnalysis(todo);
 			},
 		});
 
@@ -211,32 +281,412 @@ class LifeUpTodoPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const loaded = (await this.loadData()) || {};
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
-		if (loaded.defaultGold != null && loaded.defaultCoin == null) {
-			const converted = Number(loaded.defaultGold);
-			this.settings.defaultCoin = Number.isFinite(converted) ? converted : 0;
+		const loadedRaw = await this.loadData();
+		const loaded = (loadedRaw && typeof loadedRaw === 'object') ? loadedRaw : {};
+		const migrated = this.migrateSettings(loaded);
+		this.settings = this.sanitizeSettings(migrated);
+
+		if (this.settings.settingsVersion !== SETTINGS_VERSION) {
+			this.settings.settingsVersion = SETTINGS_VERSION;
 		}
-		if (loaded.diarySyncMode == null) {
-			this.settings.diarySyncMode = loaded.enableDiaryAutoSync ? 'auto' : 'manual';
+
+		const changed = JSON.stringify(loaded) !== JSON.stringify(this.settings);
+		if (changed) {
+			await this.saveSettings();
 		}
-		if (!['manual', 'auto'].includes(this.settings.diarySyncMode)) {
-			this.settings.diarySyncMode = 'manual';
+	}
+
+	migrateSettings(rawSettings) {
+		const migrated = Object.assign({}, rawSettings || {});
+		const currentVersion = Number(migrated.settingsVersion || 0);
+
+		if (currentVersion < 1) {
+			if (migrated.defaultGold != null && migrated.defaultCoin == null) {
+				migrated.defaultCoin = migrated.defaultGold;
+			}
+			if (migrated.category != null && migrated.taskCategoryId == null) {
+				migrated.taskCategoryId = migrated.category;
+			}
+			if (migrated.diarySyncMode == null) {
+				migrated.diarySyncMode = migrated.enableDiaryAutoSync ? 'auto' : 'manual';
+			}
+			if (migrated.taskPullMode == null) {
+				migrated.taskPullMode = 'auto';
+			}
+			if (migrated.feelingCaptureMode == null) {
+				migrated.feelingCaptureMode = 'prefix-only';
+			}
 		}
-		if (loaded.category != null && loaded.taskCategoryId == null) {
-			const convertedCategory = Number(loaded.category);
-			this.settings.taskCategoryId = Number.isFinite(convertedCategory) ? convertedCategory : 0;
+
+		if (currentVersion < 2) {
+			// Backward compatibility for older/custom field names.
+			if (migrated.aiSystemPromptTemplate == null) {
+				migrated.aiSystemPromptTemplate = migrated.aiSystemPrompt || migrated.systemPrompt || DEFAULT_AI_SYSTEM_PROMPT;
+			}
+			if (migrated.aiUserPromptTemplate == null) {
+				migrated.aiUserPromptTemplate = migrated.aiUserPrompt || migrated.userPrompt || DEFAULT_AI_USER_PROMPT;
+			}
+
+			if (typeof migrated.aiSystemPromptTemplate !== 'string' || !migrated.aiSystemPromptTemplate.trim()) {
+				migrated.aiSystemPromptTemplate = DEFAULT_AI_SYSTEM_PROMPT;
+			}
+			if (typeof migrated.aiUserPromptTemplate !== 'string' || !migrated.aiUserPromptTemplate.trim()) {
+				migrated.aiUserPromptTemplate = DEFAULT_AI_USER_PROMPT;
+			}
 		}
-		if (!this.settings.diarySyncedMap || typeof this.settings.diarySyncedMap !== 'object') {
-			this.settings.diarySyncedMap = {};
+
+		if (currentVersion < 3) {
+			if (migrated.aiSkillDefinitionsJson == null) {
+				migrated.aiSkillDefinitionsJson = migrated.aiSkillsJson || migrated.skillDefinitionsJson || DEFAULT_AI_SKILLS_JSON;
+			}
+			if (typeof migrated.aiSkillDefinitionsJson !== 'string' || !migrated.aiSkillDefinitionsJson.trim()) {
+				migrated.aiSkillDefinitionsJson = DEFAULT_AI_SKILLS_JSON;
+			}
 		}
-		if (!['manual', 'auto'].includes(this.settings.taskPullMode)) {
-			this.settings.taskPullMode = 'auto';
+
+		migrated.settingsVersion = SETTINGS_VERSION;
+		return migrated;
+	}
+
+	sanitizeSettings(rawSettings) {
+		const safe = Object.assign({}, DEFAULT_SETTINGS);
+		const raw = rawSettings || {};
+
+		safe.baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl : DEFAULT_SETTINGS.baseUrl;
+		safe.host = typeof raw.host === 'string' && raw.host.trim() ? raw.host : DEFAULT_SETTINGS.host;
+		safe.port = this.sanitizeNumber(raw.port, DEFAULT_SETTINGS.port);
+		safe.taskCategoryId = this.sanitizeNumber(raw.taskCategoryId, DEFAULT_SETTINGS.taskCategoryId);
+		safe.defaultCoin = this.sanitizeNumber(raw.defaultCoin, DEFAULT_SETTINGS.defaultCoin);
+		safe.goldItemId = this.sanitizeNumber(raw.goldItemId, DEFAULT_SETTINGS.goldItemId);
+		safe.enableSkillQuery = Boolean(raw.enableSkillQuery);
+
+		safe.diarySyncMode = ['manual', 'auto'].includes(raw.diarySyncMode)
+			? raw.diarySyncMode
+			: DEFAULT_SETTINGS.diarySyncMode;
+		safe.enableDiaryAutoSync = safe.diarySyncMode === 'auto';
+		safe.diaryFolder = typeof raw.diaryFolder === 'string' ? raw.diaryFolder : DEFAULT_SETTINGS.diaryFolder;
+		safe.diaryTitlePattern = typeof raw.diaryTitlePattern === 'string'
+			? raw.diaryTitlePattern
+			: DEFAULT_SETTINGS.diaryTitlePattern;
+		safe.onlySyncTodayDiary = Boolean(raw.onlySyncTodayDiary);
+
+		safe.enableFeelingSync = Boolean(raw.enableFeelingSync);
+		safe.feelingPrefix = typeof raw.feelingPrefix === 'string' && raw.feelingPrefix.length > 0
+			? raw.feelingPrefix
+			: DEFAULT_SETTINGS.feelingPrefix;
+		safe.feelingCaptureMode = ['prefix-only', 'prefix-until-blank'].includes(raw.feelingCaptureMode)
+			? raw.feelingCaptureMode
+			: DEFAULT_SETTINGS.feelingCaptureMode;
+		safe.strictFeelingBinding = raw.strictFeelingBinding == null
+			? DEFAULT_SETTINGS.strictFeelingBinding
+			: Boolean(raw.strictFeelingBinding);
+
+		safe.enableAiFeature = Boolean(raw.enableAiFeature);
+		safe.useSystemKeychain = raw.useSystemKeychain == null
+			? DEFAULT_SETTINGS.useSystemKeychain
+			: Boolean(raw.useSystemKeychain);
+		safe.aiApiBaseUrl = typeof raw.aiApiBaseUrl === 'string' && raw.aiApiBaseUrl.trim()
+			? raw.aiApiBaseUrl
+			: DEFAULT_SETTINGS.aiApiBaseUrl;
+		safe.aiModel = typeof raw.aiModel === 'string' && raw.aiModel.trim()
+			? raw.aiModel
+			: DEFAULT_SETTINGS.aiModel;
+		safe.aiApiKey = typeof raw.aiApiKey === 'string'
+			? raw.aiApiKey
+			: DEFAULT_SETTINGS.aiApiKey;
+		safe.aiSystemPromptTemplate = typeof raw.aiSystemPromptTemplate === 'string' && raw.aiSystemPromptTemplate.trim()
+			? raw.aiSystemPromptTemplate
+			: DEFAULT_SETTINGS.aiSystemPromptTemplate;
+		safe.aiUserPromptTemplate = typeof raw.aiUserPromptTemplate === 'string' && raw.aiUserPromptTemplate.trim()
+			? raw.aiUserPromptTemplate
+			: DEFAULT_SETTINGS.aiUserPromptTemplate;
+		safe.aiSkillDefinitionsJson = typeof raw.aiSkillDefinitionsJson === 'string' && raw.aiSkillDefinitionsJson.trim()
+			? raw.aiSkillDefinitionsJson
+			: DEFAULT_SETTINGS.aiSkillDefinitionsJson;
+
+		safe.enableTaskPullToDiary = Boolean(raw.enableTaskPullToDiary);
+		safe.taskPullMode = ['manual', 'auto'].includes(raw.taskPullMode)
+			? raw.taskPullMode
+			: DEFAULT_SETTINGS.taskPullMode;
+		safe.pullTaskCategoryId = this.sanitizeNumber(raw.pullTaskCategoryId, DEFAULT_SETTINGS.pullTaskCategoryId);
+		safe.pullSectionTitle = typeof raw.pullSectionTitle === 'string' && raw.pullSectionTitle.trim()
+			? raw.pullSectionTitle
+			: DEFAULT_SETTINGS.pullSectionTitle;
+
+		if (raw.diarySyncedMap && typeof raw.diarySyncedMap === 'object' && !Array.isArray(raw.diarySyncedMap)) {
+			safe.diarySyncedMap = raw.diarySyncedMap;
+		} else {
+			safe.diarySyncedMap = {};
 		}
+
+		safe.timeoutMs = this.sanitizeNumber(raw.timeoutMs, DEFAULT_SETTINGS.timeoutMs);
+		safe.settingsVersion = SETTINGS_VERSION;
+		return safe;
+	}
+
+	sanitizeNumber(value, fallback) {
+		const n = Number(value);
+		return Number.isFinite(n) ? n : fallback;
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async initKeytar() {
+		this.keytar = null;
+		this.keytarReady = false;
+
+		if (!Platform.isDesktopApp || !this.settings.useSystemKeychain) {
+			return;
+		}
+
+		try {
+			// keytar is desktop-only and optional
+			// eslint-disable-next-line global-require
+			this.keytar = require('keytar');
+			this.keytarReady = Boolean(this.keytar);
+		} catch (err) {
+			console.warn('[lifeup-todo-plugin] keytar 不可用，将回退到 data.json:', err);
+			this.keytar = null;
+			this.keytarReady = false;
+		}
+	}
+
+	async getAiApiKey() {
+		if (this.settings.useSystemKeychain && this.keytarReady) {
+			try {
+				const key = await this.keytar.getPassword(AI_KEYCHAIN_SERVICE, AI_KEYCHAIN_ACCOUNT);
+				if (key) {
+					return key;
+				}
+			} catch (err) {
+				console.warn('[lifeup-todo-plugin] 读取钥匙串失败，回退 data.json:', err);
+			}
+		}
+
+		return String(this.settings.aiApiKey || '');
+	}
+
+	async setAiApiKey(rawValue) {
+		const key = String(rawValue || '').trim();
+
+		if (this.settings.useSystemKeychain && this.keytarReady) {
+			try {
+				if (key) {
+					await this.keytar.setPassword(AI_KEYCHAIN_SERVICE, AI_KEYCHAIN_ACCOUNT, key);
+				} else {
+					await this.keytar.deletePassword(AI_KEYCHAIN_SERVICE, AI_KEYCHAIN_ACCOUNT);
+				}
+				this.settings.aiApiKey = '';
+				await this.saveSettings();
+				return 'keychain';
+			} catch (err) {
+				console.warn('[lifeup-todo-plugin] 写入钥匙串失败，回退 data.json:', err);
+			}
+		}
+
+		this.settings.aiApiKey = key;
+		await this.saveSettings();
+		return 'data';
+	}
+
+	getDefaultAiSystemPrompt() {
+		const value = String(this.settings.aiSystemPromptTemplate || '').trim() || DEFAULT_AI_SYSTEM_PROMPT;
+		const skillGuide = this.buildAiSkillGuideText();
+		if (value.includes('{{skillGuide}}')) {
+			return value.replace(/\{\{\s*skillGuide\s*\}\}/g, skillGuide);
+		}
+		return `${value}\n${skillGuide}`;
+	}
+
+	buildAiUserPrompt(todoTitle) {
+		const template = String(this.settings.aiUserPromptTemplate || '').trim() || DEFAULT_AI_USER_PROMPT;
+		const skillGuide = this.buildAiSkillGuideText();
+		let prompt = template
+			.replace(/\{\{\s*todoTitle\s*\}\}/g, String(todoTitle || '').trim())
+			.replace(/\{\{\s*skillGuide\s*\}\}/g, skillGuide);
+
+		if (!template.includes('{{skillGuide}}')) {
+			prompt = `${prompt}\n${skillGuide}`;
+		}
+		return prompt;
+	}
+
+	getAiSkillDefinitions() {
+		const raw = String(this.settings.aiSkillDefinitionsJson || '').trim();
+		if (!raw) {
+			return DEFAULT_AI_SKILLS;
+		}
+
+		try {
+			const parsed = JSON.parse(raw);
+			if (!Array.isArray(parsed)) {
+				return DEFAULT_AI_SKILLS;
+			}
+
+			const rows = [];
+			const idSet = new Set();
+			for (const item of parsed) {
+				const id = Number(item?.id);
+				if (!Number.isFinite(id)) {
+					continue;
+				}
+				const safeId = Math.round(id);
+				if (safeId <= 0 || idSet.has(safeId)) {
+					continue;
+				}
+				idSet.add(safeId);
+				rows.push({
+					id: safeId,
+					description: String(item?.description || item?.name || '').trim(),
+				});
+			}
+
+			if (rows.length === 0) {
+				return DEFAULT_AI_SKILLS;
+			}
+
+			return rows;
+		} catch (_) {
+			return DEFAULT_AI_SKILLS;
+		}
+	}
+
+	buildAiSkillGuideText() {
+		const skills = this.getAiSkillDefinitions();
+		const ids = skills.map((s) => s.id);
+		const detailLines = skills.map((s) => `- ${s.id}: ${s.description || '未命名技能'}`);
+		return [
+			`skill_id 可选数量：${skills.length}`,
+			`skill_id 可选 ID：${ids.join(', ')}`,
+			'技能说明：',
+			...detailLines,
+			'请只在上述 ID 中选择 skill_id。',
+		].join('\n');
+	}
+
+	async promptTaskWriteOptions(todoTitle, initialOptions = {}) {
+		return await new Promise((resolve) => {
+			new TaskWriteOptionsModal(this.app, this, todoTitle, initialOptions, (payload) => resolve(payload)).open();
+		});
+	}
+
+	parseJsonFromAiText(text) {
+		const raw = String(text || '').trim();
+		if (!raw) {
+			throw new Error('AI 返回为空');
+		}
+
+		try {
+			return JSON.parse(raw);
+		} catch (_) {
+			// try fenced json
+			const fenced = raw.match(/```json\s*([\s\S]*?)```/i) || raw.match(/```\s*([\s\S]*?)```/i);
+			if (fenced && fenced[1]) {
+				return JSON.parse(fenced[1].trim());
+			}
+		}
+
+		throw new Error('AI 返回不是有效 JSON');
+	}
+
+	normalizeAiAnalysis(result) {
+		const safeNum = (v, min, max, fallback) => {
+			const n = Number(v);
+			if (!Number.isFinite(n)) {
+				return fallback;
+			}
+			if (n < min || n > max) {
+				return fallback;
+			}
+			return Math.round(n);
+		};
+
+		const skills = this.getAiSkillDefinitions();
+		const allowedSkillIds = new Set(skills.map((s) => s.id));
+		const fallbackSkillId = skills[0]?.id || 1;
+		const rawSkillId = Number(result?.skill_id);
+		const normalizedSkillId = Number.isFinite(rawSkillId) && allowedSkillIds.has(Math.round(rawSkillId))
+			? Math.round(rawSkillId)
+			: fallbackSkillId;
+
+		return {
+			importance: safeNum(result?.importance, 1, 4, 2),
+			difficulty: safeNum(result?.difficulty, 1, 4, 2),
+			urgency: safeNum(result?.urgency, 1, 4, 2),
+			skill_id: normalizedSkillId,
+			deadline_text: String(result?.deadline_text || ''),
+			reason: String(result?.reason || ''),
+		};
+	}
+
+	async callAiChat(messages) {
+		const apiKey = await this.getAiApiKey();
+		if (!apiKey) {
+			throw new Error('未配置 AI API Key');
+		}
+
+		const apiUrl = String(this.settings.aiApiBaseUrl || '').trim();
+		if (!apiUrl) {
+			throw new Error('未配置 AI API 地址');
+		}
+
+		const model = String(this.settings.aiModel || '').trim() || 'gpt-4o-mini';
+		const res = await requestUrl({
+			url: apiUrl,
+			method: 'POST',
+			throw: false,
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				model,
+				messages,
+				temperature: 0.3,
+			}),
+			timeout: Number(this.settings.timeoutMs) || 10000,
+		});
+
+		if (res.status < 200 || res.status >= 300) {
+			throw new Error(`AI HTTP ${res.status}`);
+		}
+
+		const data = res.json || (res.text ? JSON.parse(res.text) : {});
+		const content = data?.choices?.[0]?.message?.content;
+		if (!content) {
+			throw new Error('AI 响应无内容');
+		}
+
+		return String(content);
+	}
+
+	async analyzeTodoWithAi(todoTitle) {
+		const systemPrompt = this.getDefaultAiSystemPrompt();
+		const userPrompt = this.buildAiUserPrompt(todoTitle);
+		const content = await this.callAiChat([
+			{ role: 'system', content: systemPrompt },
+			{ role: 'user', content: userPrompt },
+		]);
+		const parsed = this.parseJsonFromAiText(content);
+		return this.normalizeAiAnalysis(parsed);
+	}
+
+	async previewAiAnalysis(todoTitle) {
+		if (!this.settings.enableAiFeature) {
+			new Notice('请先在设置中启用实验性 AI 功能');
+			return;
+		}
+
+		try {
+			new Notice('AI 分析中...');
+			const analysis = await this.analyzeTodoWithAi(todoTitle);
+			new AiAnalysisPreviewModal(this.app, this, todoTitle, analysis).open();
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			new Notice(`AI 分析失败：${message}`);
+		}
 	}
 
 	extractTodoFromLine(lineText) {
@@ -528,12 +978,15 @@ class LifeUpTodoPlugin extends Plugin {
 
 			let skills = [];
 			if (this.settings.enableSkillQuery) {
-				for (let skillId = 1; skillId <= 6; skillId += 1) {
+				const skillDefs = this.getAiSkillDefinitions();
+				for (const skillDef of skillDefs) {
+					const skillId = Number(skillDef.id);
+					const fallbackName = String(skillDef.description || `属性${skillId}`);
 					try {
 						const raw = await this.callLifeUpApi(`lifeup://api/query_skill?id=${skillId}`);
 						skills.push({
 							id: skillId,
-							name: raw?.name ?? `属性${skillId}`,
+							name: raw?.name ?? fallbackName,
 							level: this.readNumberField(raw, ['level']),
 							totalExp: this.readNumberField(raw, ['total_exp']),
 							currentLevelExp: this.readNumberField(raw, ['current_level_exp']),
@@ -542,7 +995,7 @@ class LifeUpTodoPlugin extends Plugin {
 					} catch (_) {
 						skills.push({
 							id: skillId,
-							name: `属性${skillId}`,
+							name: fallbackName,
 							level: null,
 							totalExp: null,
 							currentLevelExp: null,
@@ -627,10 +1080,85 @@ class LifeUpTodoPlugin extends Plugin {
 	}
 
 	async createLifeUpTask(title) {
-		const safeTitle = encodeURIComponent(title);
+		return await this.createLifeUpTaskAdvanced(title, {});
+	}
+
+	parseDeadlineTextToTimestamp(deadlineText) {
+		const raw = String(deadlineText || '').trim();
+		if (!raw) {
+			return null;
+		}
+
+		if (/^\d{12,14}$/.test(raw)) {
+			const ts = Number(raw);
+			return Number.isFinite(ts) ? ts : null;
+		}
+
+		const zhMatch = raw.match(/^(今天|明天)\s*(\d{1,2}):(\d{2})$/);
+		if (zhMatch) {
+			const base = new Date();
+			if (zhMatch[1] === '明天') {
+				base.setDate(base.getDate() + 1);
+			}
+			const h = Number(zhMatch[2]);
+			const m = Number(zhMatch[3]);
+			if (Number.isFinite(h) && Number.isFinite(m) && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+				base.setHours(h, m, 0, 0);
+				return base.getTime();
+			}
+		}
+
+		const parsed = new Date(raw);
+		if (!Number.isNaN(parsed.getTime())) {
+			return parsed.getTime();
+		}
+
+		return null;
+	}
+
+	async createLifeUpTaskAdvanced(title, options = {}) {
 		const coin = Number(this.settings.defaultCoin) || 0;
 		const category = Number(this.settings.taskCategoryId) || 0;
-		const apiUrl = `lifeup://api/add_task?todo=${safeTitle}&category=${category}&coin=${coin}`;
+		const params = new URLSearchParams();
+		params.append('todo', String(title || '').trim());
+		params.append('category', String(category));
+		params.append('coin', String(coin));
+
+		const importance = Number(options.importance);
+		if (Number.isFinite(importance) && importance >= 1 && importance <= 4) {
+			params.append('importance', String(Math.round(importance)));
+		}
+
+		const difficulty = Number(options.difficulty);
+		if (Number.isFinite(difficulty) && difficulty >= 1 && difficulty <= 4) {
+			params.append('difficulty', String(Math.round(difficulty)));
+		}
+
+		const skillId = Number(options.skill_id);
+		if (Number.isFinite(skillId) && skillId > 0) {
+			params.append('skills', String(Math.round(skillId)));
+		}
+
+		const deadlineTs = this.parseDeadlineTextToTimestamp(options.deadline_text);
+		if (deadlineTs) {
+			params.append('deadline', String(deadlineTs));
+		}
+
+		const noteParts = [];
+		if (options.reason) {
+			noteParts.push(`AI说明: ${String(options.reason).trim()}`);
+		}
+		const urgency = Number(options.urgency);
+		if (Number.isFinite(urgency) && urgency >= 1 && urgency <= 4) {
+			noteParts.push(`AI紧急度: ${Math.round(urgency)}`);
+		}
+		if (noteParts.length > 0) {
+			params.append('notes', noteParts.join('\n'));
+		}
+
+		// URLSearchParams encodes spaces as '+', but LifeUp add_task expects '%20'.
+		const queryString = params.toString().replace(/\+/g, '%20');
+		const apiUrl = `lifeup://api/add_task?${queryString}`;
 		return await this.callLifeUpApi(apiUrl);
 	}
 
@@ -658,12 +1186,12 @@ class LifeUpTodoPlugin extends Plugin {
 		return null;
 	}
 
-	async createLifeUpTaskWithSubtasks(node) {
-		const createdTask = await this.createLifeUpTask(node.title);
+	async createLifeUpTaskWithSubtasks(node, mainTaskOptions = {}) {
+		const createdTask = await this.createLifeUpTaskAdvanced(node.title, mainTaskOptions);
 		const taskId = this.extractFirstNumber(createdTask, ['task_id', '_ID', 'id']);
 
 		if (!Array.isArray(node.children) || node.children.length === 0) {
-			return;
+			return { taskId };
 		}
 
 		if (!taskId) {
@@ -680,6 +1208,160 @@ class LifeUpTodoPlugin extends Plugin {
 					await this.completeLifeUpSubtask(taskId, subtaskId);
 				}
 			}
+		}
+
+		return { taskId };
+	}
+
+	getFeelingPrefix() {
+		const raw = String(this.settings.feelingPrefix || '').trim();
+		return raw || '>';
+	}
+
+	lineHasFeelingPrefix(lineText) {
+		const prefix = this.getFeelingPrefix();
+		const line = String(lineText || '').trimStart();
+		if (!line.startsWith(prefix)) {
+			return false;
+		}
+		return true;
+	}
+
+	extractFeelingContentFromLine(lineText) {
+		const prefix = this.getFeelingPrefix();
+		const line = String(lineText || '').trimStart();
+		if (!line.startsWith(prefix)) {
+			return null;
+		}
+		return line.slice(prefix.length).trim();
+	}
+
+	extractFeelingBlocksFromText(text) {
+		const lines = String(text || '').split(/\r?\n/);
+		const blocks = [];
+
+		let recentRootTitle = null;
+		let canBindToRecentRoot = false;
+		let inManagedBlock = false;
+
+		for (let i = 0; i < lines.length; i += 1) {
+			const line = lines[i];
+			const trimmed = line.trim();
+
+			if (trimmed === LIFEUP_TASKS_BLOCK_START) {
+				inManagedBlock = true;
+				continue;
+			}
+			if (trimmed === LIFEUP_TASKS_BLOCK_END) {
+				inManagedBlock = false;
+				continue;
+			}
+			if (inManagedBlock) {
+				continue;
+			}
+
+			const todo = this.parseTodoLine(line);
+			if (todo) {
+				if (todo.indent === 0) {
+					recentRootTitle = todo.title;
+				}
+				canBindToRecentRoot = Boolean(recentRootTitle);
+				continue;
+			}
+
+			if (!trimmed) {
+				canBindToRecentRoot = false;
+				continue;
+			}
+
+			if (this.lineHasFeelingPrefix(line)) {
+				const parts = [];
+				let j = i;
+
+				if (this.settings.feelingCaptureMode === 'prefix-until-blank') {
+					while (j < lines.length) {
+						const currentLine = lines[j];
+						const currentTrimmed = currentLine.trim();
+
+						if (!currentTrimmed) {
+							break;
+						}
+						if (currentTrimmed === LIFEUP_TASKS_BLOCK_START || currentTrimmed === LIFEUP_TASKS_BLOCK_END) {
+							break;
+						}
+						if (j !== i && this.parseTodoLine(currentLine)) {
+							break;
+						}
+
+						if (this.lineHasFeelingPrefix(currentLine)) {
+							const content = this.extractFeelingContentFromLine(currentLine);
+							if (content) {
+								parts.push(content);
+							}
+						} else {
+							parts.push(currentLine.trim());
+						}
+
+						j += 1;
+					}
+				} else {
+					while (j < lines.length && this.lineHasFeelingPrefix(lines[j])) {
+						const content = this.extractFeelingContentFromLine(lines[j]);
+						if (content) {
+							parts.push(content);
+						}
+						j += 1;
+					}
+				}
+
+				if (parts.length > 0) {
+					const content = parts.join('\n');
+					const bindByAdjacency = canBindToRecentRoot && Boolean(recentRootTitle);
+					const relatedRootTitle = bindByAdjacency ? recentRootTitle : null;
+					blocks.push({
+						content,
+						relatedRootTitle,
+						strictOnly: Boolean(this.settings.strictFeelingBinding),
+					});
+				}
+
+				i = j - 1;
+				if (!this.settings.strictFeelingBinding) {
+					canBindToRecentRoot = bindByAdjacency;
+				} else {
+					canBindToRecentRoot = false;
+				}
+				continue;
+			}
+
+			canBindToRecentRoot = false;
+		}
+
+		return blocks;
+	}
+
+	async createLifeUpFeeling(content, relatedTaskId = null) {
+		const safeContent = encodeURIComponent(String(content || '').trim());
+		if (!safeContent) {
+			return null;
+		}
+
+		let apiUrl = `lifeup://api/feeling?content=${safeContent}`;
+		if (relatedTaskId != null) {
+			apiUrl += `&relate_type=0&relate_id=${Number(relatedTaskId)}`;
+		}
+		return await this.callLifeUpApi(apiUrl);
+	}
+
+	async resolveTaskIdByTitle(taskTitle) {
+		if (!taskTitle) {
+			return null;
+		}
+		try {
+			const taskRaw = await this.querySimple('task', { task_name: taskTitle, withSubTasks: true });
+			return this.extractFirstNumber(taskRaw, ['_ID', 'task_id', 'id']);
+		} catch (_) {
+			return null;
 		}
 	}
 
@@ -989,10 +1671,14 @@ class LifeUpTodoPlugin extends Plugin {
 		const syncedMap = this.settings.diarySyncedMap || {};
 		const syncedList = Array.isArray(syncedMap[file.path]) ? syncedMap[file.path] : [];
 		const syncedSet = new Set(syncedList);
+		const taskIdMap = new Map();
 
 		let success = 0;
 		let failed = 0;
 		let skipped = 0;
+		let feelingSuccess = 0;
+		let feelingFailed = 0;
+		let feelingSkipped = 0;
 
 		for (const node of currentTodoNodes) {
 			const signature = this.buildTodoNodeSignature(node);
@@ -1002,7 +1688,11 @@ class LifeUpTodoPlugin extends Plugin {
 			}
 
 			try {
-				await this.createLifeUpTaskWithSubtasks(node);
+				const created = await this.createLifeUpTaskWithSubtasks(node);
+				const createdTaskId = this.extractFirstNumber(created, ['taskId']);
+				if (createdTaskId) {
+					taskIdMap.set(node.title, createdTaskId);
+				}
 				syncedSet.add(signature);
 				syncedSet.add(node.title);
 				success += 1;
@@ -1012,15 +1702,51 @@ class LifeUpTodoPlugin extends Plugin {
 			}
 		}
 
+		if (this.settings.enableFeelingSync) {
+			const feelingBlocks = this.extractFeelingBlocksFromText(syncContent);
+			for (const block of feelingBlocks) {
+				const relatedTitle = block.relatedRootTitle || '';
+				const feelingSignature = `feeling:${relatedTitle}:${block.content}`;
+				if (syncedSet.has(feelingSignature)) {
+					feelingSkipped += 1;
+					continue;
+				}
+
+				let relatedTaskId = null;
+				if (relatedTitle) {
+					relatedTaskId = taskIdMap.get(relatedTitle) || null;
+					if (!relatedTaskId) {
+						relatedTaskId = await this.resolveTaskIdByTitle(relatedTitle);
+						if (relatedTaskId) {
+							taskIdMap.set(relatedTitle, relatedTaskId);
+						}
+					}
+				}
+
+				try {
+					await this.createLifeUpFeeling(block.content, relatedTaskId);
+					syncedSet.add(feelingSignature);
+					feelingSuccess += 1;
+				} catch (err) {
+					feelingFailed += 1;
+					console.error('[lifeup-todo-plugin] 感想同步失败:', block.content, err);
+				}
+			}
+		}
+
 		syncedMap[file.path] = Array.from(syncedSet);
 		this.settings.diarySyncedMap = syncedMap;
 		await this.saveSettings();
 
 		if (notifyResult) {
-			new Notice(`日记同步完成：新增 ${success}，跳过 ${skipped}，失败 ${failed}`);
+			if (this.settings.enableFeelingSync) {
+				new Notice(`日记同步完成：任务 新增 ${success}/跳过 ${skipped}/失败 ${failed}；感想 新增 ${feelingSuccess}/跳过 ${feelingSkipped}/失败 ${feelingFailed}`);
+			} else {
+				new Notice(`日记同步完成：新增 ${success}，跳过 ${skipped}，失败 ${failed}`);
+			}
 		}
 
-		return { success, failed, skipped };
+		return { success, failed, skipped, feelingSuccess, feelingFailed, feelingSkipped };
 	}
 
 	async pushTodosToLifeUp(todoTitles) {
@@ -1031,10 +1757,17 @@ class LifeUpTodoPlugin extends Plugin {
 
 		let success = 0;
 		let failed = 0;
+		let cancelled = 0;
 
 		for (const title of todoTitles) {
 			try {
-				await this.createLifeUpTask(title);
+				const modalResult = await this.promptTaskWriteOptions(title, {});
+				if (!modalResult || !modalResult.confirmed) {
+					cancelled += 1;
+					continue;
+				}
+
+				await this.createLifeUpTaskAdvanced(title, modalResult.options || {});
 				success += 1;
 			} catch (err) {
 				failed += 1;
@@ -1042,12 +1775,12 @@ class LifeUpTodoPlugin extends Plugin {
 			}
 		}
 
-		if (failed === 0) {
+		if (failed === 0 && cancelled === 0) {
 			new Notice(`已写入 LifeUp：${success} 条待办`);
 			return;
 		}
 
-		new Notice(`写入完成：成功 ${success}，失败 ${failed}`);
+		new Notice(`写入完成：成功 ${success}，取消 ${cancelled}，失败 ${failed}`);
 	}
 
 	async pushTodoNodesToLifeUp(todoNodes) {
@@ -1058,10 +1791,17 @@ class LifeUpTodoPlugin extends Plugin {
 
 		let success = 0;
 		let failed = 0;
+		let cancelled = 0;
 
 		for (const node of todoNodes) {
 			try {
-				await this.createLifeUpTaskWithSubtasks(node);
+				const modalResult = await this.promptTaskWriteOptions(node.title, {});
+				if (!modalResult || !modalResult.confirmed) {
+					cancelled += 1;
+					continue;
+				}
+
+				await this.createLifeUpTaskWithSubtasks(node, modalResult.options || {});
 				success += 1;
 			} catch (err) {
 				failed += 1;
@@ -1069,12 +1809,12 @@ class LifeUpTodoPlugin extends Plugin {
 			}
 		}
 
-		if (failed === 0) {
+		if (failed === 0 && cancelled === 0) {
 			new Notice(`已写入 LifeUp：${success} 条待办`);
 			return;
 		}
 
-		new Notice(`写入完成：成功 ${success}，失败 ${failed}`);
+		new Notice(`写入完成：成功 ${success}，取消 ${cancelled}，失败 ${failed}`);
 	}
 }
 
@@ -1157,7 +1897,7 @@ class LifeUpPanelView extends ItemView {
 		}
 
 		if (this.plugin.settings.enableSkillQuery) {
-			container.createEl('h4', { text: '属性查询（query_skill: 1~6）' });
+			container.createEl('h4', { text: '属性查询（query_skill: 按 AI Skills 定义）' });
 			const skillList = container.createEl('ul', { cls: 'lifeup-panel-list' });
 			for (const skill of data.skills || []) {
 				const levelText = skill.level == null ? '-' : String(skill.level);
@@ -1174,6 +1914,148 @@ class LifeUpPanelView extends ItemView {
 		const li = listEl.createEl('li');
 		li.createSpan({ text: `${label}：` });
 		li.createSpan({ text: value == null ? '-' : String(value) });
+	}
+}
+
+class AiAnalysisPreviewModal extends Modal {
+	constructor(app, plugin, todoTitle, analysis) {
+		super(app);
+		this.plugin = plugin;
+		this.todoTitle = todoTitle;
+		this.analysis = analysis;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl('h3', { text: 'AI 分析预览' });
+		contentEl.createEl('p', { text: `待办：${this.todoTitle}` });
+
+		const list = contentEl.createEl('ul');
+		list.createEl('li', { text: `重要程度（importance）：${this.analysis.importance}` });
+		list.createEl('li', { text: `困难程度（difficulty）：${this.analysis.difficulty}` });
+		list.createEl('li', { text: `紧急程度（urgency）：${this.analysis.urgency}` });
+		list.createEl('li', { text: `建议属性 ID（skill_id）：${this.analysis.skill_id}` });
+		list.createEl('li', { text: `时间建议（deadline_text）：${this.analysis.deadline_text || '-'}` });
+
+		if (this.analysis.reason) {
+			contentEl.createEl('p', { text: `说明：${this.analysis.reason}` });
+		}
+
+		const actionRow = contentEl.createDiv({ cls: 'lifeup-panel-actions' });
+		const applyBtn = actionRow.createEl('button', { text: '按 AI 结果写入 LifeUp' });
+		const closeBtn = actionRow.createEl('button', { text: '关闭' });
+
+		applyBtn.addEventListener('click', async () => {
+			applyBtn.disabled = true;
+			try {
+				await this.plugin.createLifeUpTaskAdvanced(this.todoTitle, this.analysis);
+				new Notice('已按 AI 结果写入 LifeUp');
+				this.close();
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				new Notice(`写入失败：${message}`);
+				applyBtn.disabled = false;
+			}
+		});
+
+		closeBtn.addEventListener('click', () => this.close());
+	}
+}
+
+class TaskWriteOptionsModal extends Modal {
+	constructor(app, plugin, todoTitle, initialOptions, onSubmit) {
+		super(app);
+		this.plugin = plugin;
+		this.todoTitle = String(todoTitle || '').trim();
+		this.initialOptions = initialOptions || {};
+		this.onSubmit = onSubmit;
+		this.closedBySubmit = false;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl('h3', { text: '写入前编辑参数' });
+		contentEl.createEl('p', { text: `待办：${this.todoTitle}` });
+
+		const form = contentEl.createDiv({ cls: 'lifeup-prewrite-form' });
+
+		const parseRangeValue = (raw, min, max) => {
+			if (raw == null || raw === '') {
+				return null;
+			}
+			const n = Number(raw);
+			if (!Number.isFinite(n)) {
+				return null;
+			}
+			if (n < min || n > max) {
+				return null;
+			}
+			return Math.round(n);
+		};
+
+		const createRow = (label, placeholder, value = '') => {
+			const row = form.createDiv({ cls: 'lifeup-prewrite-row' });
+			row.createEl('label', { text: label });
+			const input = row.createEl('input', { type: 'text' });
+			input.placeholder = placeholder;
+			input.value = value;
+			return input;
+		};
+
+		const importanceInput = createRow('importance (1-4)', '留空则不传', String(this.initialOptions.importance || ''));
+		const difficultyInput = createRow('difficulty (1-4)', '留空则不传', String(this.initialOptions.difficulty || ''));
+		const skillIds = this.plugin.getAiSkillDefinitions().map((item) => item.id);
+		const skillLabel = `skill_id (${skillIds.join('/')})`;
+		const skillHint = `可选: ${skillIds.join(', ')}；留空则不传`;
+		const skillInput = createRow(skillLabel, skillHint, String(this.initialOptions.skill_id || ''));
+		const deadlineInput = createRow('deadline_text', '例如 2026-03-09 18:00 / 今天 22:00', String(this.initialOptions.deadline_text || ''));
+
+		const tips = contentEl.createEl('small', {
+			text: `提示：importance/difficulty 范围 1~4，skill_id 可选 ${skillIds.join(', ')}；留空将使用默认写入行为。`,
+		});
+		tips.addClass('lifeup-prewrite-tip');
+
+		const actions = contentEl.createDiv({ cls: 'lifeup-panel-actions' });
+		const submitBtn = actions.createEl('button', { text: '确认写入' });
+		const cancelBtn = actions.createEl('button', { text: '取消' });
+
+		submitBtn.addEventListener('click', () => {
+			const importance = parseRangeValue(importanceInput.value.trim(), 1, 4);
+			const difficulty = parseRangeValue(difficultyInput.value.trim(), 1, 4);
+			const rawSkillId = skillInput.value.trim();
+			const parsedSkillId = Number(rawSkillId);
+			const skillId = Number.isFinite(parsedSkillId) && skillIds.includes(Math.round(parsedSkillId))
+				? Math.round(parsedSkillId)
+				: null;
+			const deadlineText = String(deadlineInput.value || '').trim();
+
+			this.closedBySubmit = true;
+			this.onSubmit({
+				confirmed: true,
+				options: {
+					importance,
+					difficulty,
+					skill_id: skillId,
+					deadline_text: deadlineText,
+				},
+			});
+			this.close();
+		});
+
+		cancelBtn.addEventListener('click', () => {
+			this.closedBySubmit = true;
+			this.onSubmit({ confirmed: false, options: null });
+			this.close();
+		});
+	}
+
+	onClose() {
+		if (!this.closedBySubmit && this.onSubmit) {
+			this.onSubmit({ confirmed: false, options: null });
+		}
+		this.contentEl.empty();
 	}
 }
 
@@ -1339,6 +2221,57 @@ class LifeUpSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName('启用感想同步')
+			.setDesc('同步日记中的感想行到 LifeUp feeling 接口')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.enableFeelingSync))
+					.onChange(async (value) => {
+						this.plugin.settings.enableFeelingSync = Boolean(value);
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('感想行前缀')
+			.setDesc('例如 > 或 >!；连续前缀行会合并为一条感想')
+			.addText((text) =>
+				text
+					.setPlaceholder('>')
+					.setValue(String(this.plugin.settings.feelingPrefix || '> '))
+					.onChange(async (value) => {
+						this.plugin.settings.feelingPrefix = value || '> ';
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('感想采集模式')
+			.setDesc('仅限有前缀，或从前缀行开始采集到下一个空行')
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption('prefix-only', '仅限有前缀')
+					.addOption('prefix-until-blank', '前缀起始，持续到下一个空行')
+					.setValue(this.plugin.settings.feelingCaptureMode || 'prefix-only')
+					.onChange(async (value) => {
+						this.plugin.settings.feelingCaptureMode = value === 'prefix-until-blank' ? 'prefix-until-blank' : 'prefix-only';
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('感想严格绑定模式')
+			.setDesc('开启后：感想必须紧跟事项块（中间无空行/普通文本）才会绑定为事项感想')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.strictFeelingBinding))
+					.onChange(async (value) => {
+						this.plugin.settings.strictFeelingBinding = Boolean(value);
+						await this.plugin.saveSettings();
+					})
+			);
+
 		containerEl.createEl('h3', { text: '3) LifeUp → Obsidian（写回日记）' });
 
 		new Setting(containerEl)
@@ -1436,6 +2369,111 @@ class LifeUpSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		containerEl.createEl('h3', { text: '5) 实验性 AI 配置' });
+
+		new Setting(containerEl)
+			.setName('启用实验性 AI 功能')
+			.setDesc('用于后续 AI 自动评估和建议功能')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.enableAiFeature))
+					.onChange(async (value) => {
+						this.plugin.settings.enableAiFeature = Boolean(value);
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('优先使用系统钥匙串（桌面）')
+			.setDesc('桌面端优先写入系统钥匙串；移动端或失败时自动回退 data.json')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(Boolean(this.plugin.settings.useSystemKeychain))
+					.onChange(async (value) => {
+						this.plugin.settings.useSystemKeychain = Boolean(value);
+						await this.plugin.saveSettings();
+						await this.plugin.initKeytar();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI API 地址')
+			.setDesc('例如 OpenAI 兼容接口地址')
+			.addText((text) =>
+				text
+					.setPlaceholder('https://api.openai.com/v1/chat/completions')
+					.setValue(String(this.plugin.settings.aiApiBaseUrl || ''))
+					.onChange(async (value) => {
+						this.plugin.settings.aiApiBaseUrl = value.trim() || DEFAULT_SETTINGS.aiApiBaseUrl;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI 模型')
+			.setDesc('例如 gpt-4o-mini')
+			.addText((text) =>
+				text
+					.setPlaceholder('gpt-4o-mini')
+					.setValue(String(this.plugin.settings.aiModel || ''))
+					.onChange(async (value) => {
+						this.plugin.settings.aiModel = value.trim() || DEFAULT_SETTINGS.aiModel;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI System 提示词模板')
+			.setDesc('发送给模型的 system 提示词，可按你的偏好调整')
+			.addTextArea((text) =>
+				text
+					.setPlaceholder('你是任务分析助手...')
+					.setValue(String(this.plugin.settings.aiSystemPromptTemplate || DEFAULT_AI_SYSTEM_PROMPT))
+					.onChange(async (value) => {
+						this.plugin.settings.aiSystemPromptTemplate = value || DEFAULT_AI_SYSTEM_PROMPT;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI User 提示词模板')
+			.setDesc('支持变量 {{todoTitle}}，例如：待办标题：{{todoTitle}}')
+			.addTextArea((text) =>
+				text
+					.setPlaceholder('待办标题：{{todoTitle}}')
+					.setValue(String(this.plugin.settings.aiUserPromptTemplate || DEFAULT_AI_USER_PROMPT))
+					.onChange(async (value) => {
+						this.plugin.settings.aiUserPromptTemplate = value || DEFAULT_AI_USER_PROMPT;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI Skills 定义（JSON）')
+			.setDesc('用于约束 skill_id 的可选 ID/个数/说明。格式: [{"id":1,"description":"体能"}]')
+			.addTextArea((text) =>
+				text
+					.setPlaceholder('[{"id":1,"description":"体能/健康"}]')
+					.setValue(String(this.plugin.settings.aiSkillDefinitionsJson || DEFAULT_AI_SKILLS_JSON))
+					.onChange(async (value) => {
+						this.plugin.settings.aiSkillDefinitionsJson = value || DEFAULT_AI_SKILLS_JSON;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('AI API Key')
+			.setDesc('输入后自动保存；桌面优先钥匙串，失败自动回退本地配置')
+			.addText((text) => {
+				text.inputEl.type = 'password';
+				text
+					.setPlaceholder('sk-...')
+					.setValue('')
+					.onChange(async (value) => {
+						await this.plugin.setAiApiKey(value);
+					});
+			});
 	}
 }
 
